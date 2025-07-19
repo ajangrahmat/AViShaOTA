@@ -1,5 +1,13 @@
-// AViShaOTA.cpp - Fixed Password Validation
+// AViShaOTA.cpp - ESP32 & ESP8266 Support with Fixed Password Validation
 #include "AViShaOTA.h"
+
+// Platform-specific includes for storage
+#if defined(ESP32)
+    #include <Preferences.h>
+#elif defined(ESP8266)
+    #include <EEPROM.h>
+    #include <FS.h>
+#endif
 
 // Static instance pointer
 AViShaOTA* AViShaOTA::instance = nullptr;
@@ -12,9 +20,12 @@ AViShaOTA::AViShaOTA(const String& hostname, int port) {
   this->otaPassword = "";
   this->mdnsEnabled = true;
   this->serialDebug = true;
+  this->autoReconnect = true;
   this->isInitialized = false;
   this->otaInProgress = false;
   this->webUpdateInProgress = false;
+  this->lastWiFiCheck = 0;
+  this->wifiCheckInterval = 10000;
   
   // Initialize callbacks to nullptr
   this->onStartCallback = nullptr;
@@ -28,10 +39,28 @@ AViShaOTA::AViShaOTA(const String& hostname, int port) {
 
   // Set static instance
   instance = this;
+  
+  // Initialize defaults
+  initializeDefaults();
 }
 
 // Destructor
 AViShaOTA::~AViShaOTA() {
+  cleanup();
+}
+
+// Initialize defaults
+void AViShaOTA::initializeDefaults() {
+  currentConfig = Config();
+  currentConfig.hostname = hostname;
+  currentConfig.serverPort = serverPort;
+  lastError = "";
+  startTime = millis();
+}
+
+// Cleanup resources
+void AViShaOTA::cleanup() {
+  end();
   if (server) {
     delete server;
     server = nullptr;
@@ -42,18 +71,36 @@ AViShaOTA::~AViShaOTA() {
 // Configuration methods
 void AViShaOTA::setOTAPassword(const String& password) {
   this->otaPassword = password;
+  this->currentConfig.otaPassword = password;
 }
 
 void AViShaOTA::setHostname(const String& name) {
   this->hostname = name;
+  this->currentConfig.hostname = name;
+}
+
+void AViShaOTA::setPort(int port) {
+  this->serverPort = port;
+  this->currentConfig.serverPort = port;
 }
 
 void AViShaOTA::enableMDNS(bool enable) {
   this->mdnsEnabled = enable;
+  this->currentConfig.mdnsEnabled = enable;
 }
 
 void AViShaOTA::enableSerialDebug(bool enable) {
   this->serialDebug = enable;
+  this->currentConfig.serialDebug = enable;
+}
+
+void AViShaOTA::enableAutoReconnect(bool enable) {
+  this->autoReconnect = enable;
+  this->currentConfig.autoReconnect = enable;
+}
+
+void AViShaOTA::setWiFiCheckInterval(unsigned long interval) {
+  this->wifiCheckInterval = interval;
 }
 
 // Callback setters
@@ -89,19 +136,31 @@ void AViShaOTA::onWebUpdateEnd(void (*callback)(bool success)) {
   this->onWebUpdateEndCallback = callback;
 }
 
+// End method
 void AViShaOTA::end() {
   if (server) {
     server->stop();
   }
-  ArduinoOTA.end();
-  if (mdnsEnabled) {
-    MDNS.end();
-  }
+  
+  #if defined(ESP32)
+    if (mdnsEnabled) {
+      MDNS.end();
+    }
+    // Remove WiFi event handler
+    WiFi.removeEvent(wifiEventId);
+  #elif defined(ESP8266)
+    if (mdnsEnabled) {
+      MDNS.end();
+    }
+    // Event handlers will be automatically removed
+  #endif
+  
   isInitialized = false;
   otaInProgress = false;
   webUpdateInProgress = false;
 }
 
+// Status methods
 bool AViShaOTA::isOTAInProgress() {
   return otaInProgress;
 }
@@ -110,8 +169,41 @@ bool AViShaOTA::isWebUpdateInProgress() {
   return webUpdateInProgress;
 }
 
+bool AViShaOTA::getInitializationStatus() {
+  return isInitialized;
+}
+
+String AViShaOTA::getHostname() {
+  return hostname;
+}
+
+int AViShaOTA::getPort() {
+  return serverPort;
+}
+
+bool AViShaOTA::isMDNSEnabled() {
+  return mdnsEnabled;
+}
+
+bool AViShaOTA::isSerialDebugEnabled() {
+  return serialDebug;
+}
+
+String AViShaOTA::getLastError() {
+  return lastError;
+}
+
+String AViShaOTA::getPlatform() {
+  return AVISHA_PLATFORM;
+}
+
+// Static methods
 const char* AViShaOTA::getVersion() {
   return AVISHA_OTA_VERSION;
+}
+
+String AViShaOTA::getLibraryInfo() {
+  return String("AViShaOTA v") + AVISHA_OTA_VERSION + " for " + AVISHA_PLATFORM;
 }
 
 // Main begin method
@@ -124,6 +216,7 @@ bool AViShaOTA::begin(const char* ssid, const char* password) {
   }
 
   if (!ssid || strlen(ssid) == 0) {
+    lastError = "SSID cannot be empty";
     if (serialDebug) {
       Serial.println("Error: SSID cannot be empty!");
     }
@@ -132,19 +225,171 @@ bool AViShaOTA::begin(const char* ssid, const char* password) {
 
   if (serialDebug) {
     Serial.println("Starting AViShaOTA...");
+    Serial.println("Platform: " + getPlatform());
   }
 
   // Create server instance
   if (server) {
     delete server;
   }
-  server = new WebServer(serverPort);
+  server = new AVISHA_WEBSERVER(serverPort);
 
-  // Setup WiFi
-  WiFi.mode(WIFI_STA);
-  WiFi.onEvent(wifiEventHandler);
-  WiFi.setAutoReconnect(true);
-  WiFi.persistent(true);
+  // Setup WiFi - platform specific
+  if (!setupWiFi(ssid, password)) {
+    lastError = "Failed to connect to WiFi";
+    return false;
+  }
+
+  // Setup OTA and Web Server
+  setupArduinoOTA();
+  setupWebServer();
+
+  // Start MDNS if enabled
+  if (!setupMDNS()) {
+    logMessage("Warning: MDNS setup failed");
+  }
+
+  // Start services
+  ArduinoOTA.begin();
+  server->begin();
+
+  if (serialDebug) {
+    Serial.println("AViShaOTA started successfully!");
+    Serial.print("Upload URL: ");
+    Serial.println(getUploadURL());
+  }
+
+  isInitialized = true;
+  return true;
+}
+
+// Begin AP mode
+bool AViShaOTA::beginAP(const char* ssid, const char* password) {
+  if (isInitialized) {
+    if (serialDebug) {
+      Serial.println("AViShaOTA already initialized!");
+    }
+    return true;
+  }
+
+  if (!ssid || strlen(ssid) == 0) {
+    lastError = "AP SSID cannot be empty";
+    if (serialDebug) {
+      Serial.println("Error: AP SSID cannot be empty!");
+    }
+    return false;
+  }
+
+  if (serialDebug) {
+    Serial.println("Starting AViShaOTA in AP mode...");
+  }
+
+  // Create server instance
+  if (server) {
+    delete server;
+  }
+  server = new AVISHA_WEBSERVER(serverPort);
+
+  // Setup WiFi AP mode
+  #if defined(ESP32)
+    WiFi.mode(WIFI_AP);
+    bool apResult = WiFi.softAP(ssid, password);
+  #elif defined(ESP8266)
+    WiFi.mode(WIFI_AP);
+    bool apResult = WiFi.softAP(ssid, password);
+  #endif
+
+  if (!apResult) {
+    lastError = "Failed to start AP mode";
+    if (serialDebug) {
+      Serial.println("Error: Failed to start AP mode!");
+    }
+    return false;
+  }
+
+  if (serialDebug) {
+    Serial.println("AP Mode started!");
+    Serial.print("AP IP Address: ");
+    #if defined(ESP32)
+      Serial.println(WiFi.softAPIP());
+    #elif defined(ESP8266)
+      Serial.println(WiFi.softAPIP());
+    #endif
+  }
+
+  // Setup services
+  setupArduinoOTA();
+  setupWebServer();
+  setupMDNS();
+
+  ArduinoOTA.begin();
+  server->begin();
+
+  isInitialized = true;
+  return true;
+}
+
+// Handle method - call this in loop()
+void AViShaOTA::handle() {
+  if (!isInitialized) {
+    return;
+  }
+
+  ArduinoOTA.handle();
+  if (server) {
+    server->handleClient();
+  }
+
+  // Check WiFi connection periodically if auto-reconnect is enabled
+  if (autoReconnect && millis() - lastWiFiCheck > wifiCheckInterval) {
+    checkWiFiConnection();
+    lastWiFiCheck = millis();
+  }
+
+  #if defined(ESP8266)
+    // For ESP8266, we need to call MDNS.update() in the loop
+    if (mdnsEnabled) {
+      MDNS.update();
+    }
+  #endif
+}
+
+// Setup WiFi - platform specific
+bool AViShaOTA::setupWiFi(const char* ssid, const char* password) {
+  #if defined(ESP32)
+    WiFi.mode(WIFI_STA);
+    wifiEventId = WiFi.onEvent(wifiEventHandler);
+    WiFi.setAutoReconnect(autoReconnect);
+    WiFi.persistent(true);
+  #elif defined(ESP8266)
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(autoReconnect);
+    WiFi.persistent(true);
+    
+    // Setup event handlers for ESP8266
+    wifiConnectHandler = WiFi.onStationModeGotIP([this](const WiFiEventStationModeGotIP& event) {
+      if (serialDebug) {
+        Serial.println("WiFi connected!");
+        Serial.print("IP Address: ");
+        Serial.println(WiFi.localIP());
+        Serial.print("Upload URL: ");
+        Serial.println(getUploadURL());
+      }
+      if (onWiFiConnectedCallback) {
+        onWiFiConnectedCallback();
+      }
+    });
+    
+    wifiDisconnectHandler = WiFi.onStationModeDisconnected([this](const WiFiEventStationModeDisconnected& event) {
+      if (serialDebug) {
+        Serial.println("WiFi disconnected, attempting to reconnect...");
+      }
+      if (onWiFiDisconnectedCallback) {
+        onWiFiDisconnectedCallback();
+      }
+    });
+  #endif
+
   WiFi.begin(ssid, password);
 
   if (serialDebug) {
@@ -153,7 +398,7 @@ bool AViShaOTA::begin(const char* ssid, const char* password) {
 
   // Wait for connection with timeout
   unsigned long startTime = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startTime < 30000) {
+  while (WiFi.status() != WL_CONNECTED && millis() - startTime < currentConfig.wifiTimeout) {
     delay(500);
     if (serialDebug) {
       Serial.print(".");
@@ -173,44 +418,35 @@ bool AViShaOTA::begin(const char* ssid, const char* password) {
     Serial.println(WiFi.localIP());
   }
 
-  // Setup OTA and Web Server
-  setupArduinoOTA();
-  setupWebServer();
-
-  // Start MDNS if enabled
-  if (mdnsEnabled) {
-    if (MDNS.begin(hostname.c_str())) {
-      if (serialDebug) {
-        Serial.println("MDNS responder started");
-      }
-    } else {
-      if (serialDebug) {
-        Serial.println("Error starting MDNS responder!");
-      }
-    }
-  }
-
-  // Start services
-  ArduinoOTA.begin();
-  server->begin();
-
-  if (serialDebug) {
-    Serial.println("AViShaOTA started successfully!");
-    Serial.print("Upload URL: ");
-    Serial.println(getUploadURL());
-  }
-
-  isInitialized = true;
   return true;
 }
 
-// Handle method - call this in loop()
-void AViShaOTA::handle() {
-  if (WiFi.status() == WL_CONNECTED && isInitialized) {
-    ArduinoOTA.handle();
-    if (server) {
-      server->handleClient();
+// Setup MDNS
+bool AViShaOTA::setupMDNS() {
+  if (!mdnsEnabled) {
+    return true;
+  }
+
+  if (MDNS.begin(hostname.c_str())) {
+    if (serialDebug) {
+      Serial.println("MDNS responder started");
     }
+    return true;
+  } else {
+    if (serialDebug) {
+      Serial.println("Error starting MDNS responder!");
+    }
+    return false;
+  }
+}
+
+// Check WiFi connection
+void AViShaOTA::checkWiFiConnection() {
+  if (WiFi.status() != WL_CONNECTED && autoReconnect) {
+    if (serialDebug) {
+      Serial.println("WiFi connection lost, reconnecting...");
+    }
+    WiFi.reconnect();
   }
 }
 
@@ -285,8 +521,16 @@ void AViShaOTA::setupWebServer() {
     handleUpdate();
   });
 
+  server->on("/info", HTTP_GET, [this]() {
+    handleInfo();
+  });
+
+  server->on("/restart", HTTP_POST, [this]() {
+    handleRestart();
+  });
+
   server->onNotFound([this]() {
-    server->send(404, "text/plain", "Not Found");
+    handleNotFound();
   });
 }
 
@@ -295,55 +539,91 @@ void AViShaOTA::handleRoot() {
   server->send(200, "text/html", getUploadHTML());
 }
 
+// Handle info request
+void AViShaOTA::handleInfo() {
+  server->send(200, "application/json", getSystemInfo());
+}
+
+// Handle restart request
+void AViShaOTA::handleRestart() {
+  server->send(200, "text/plain", "Restarting device...");
+  delay(1000);
+  restart();
+}
+
+// Handle not found
+void AViShaOTA::handleNotFound() {
+  server->send(404, "text/plain", "Not Found");
+}
+
 // Handle update finish
 void AViShaOTA::handleUpdateFinish() {
   webUpdateInProgress = false;
-  if (Update.hasError()) {
-    if (serialDebug) {
-      Serial.println("Web Update failed!");
+  
+  #if defined(ESP32)
+    if (Update.hasError()) {
+      if (serialDebug) {
+        Serial.println("Web Update failed!");
+        Update.printError(Serial);
+      }
+      server->send(500, "text/plain", "Update failed");
+      if (onWebUpdateEndCallback) {
+        onWebUpdateEndCallback(false);
+      }
+    } else {
+      if (serialDebug) {
+        Serial.println("Web Update successful!");
+      }
+      server->send(200, "text/plain", "Update successful! Device will restart...");
+      if (onWebUpdateEndCallback) {
+        onWebUpdateEndCallback(true);
+      }
+      delay(1000);
+      restart();
     }
-    server->send(500, "text/plain", "Update failed");
-    if (onWebUpdateEndCallback) {
-      onWebUpdateEndCallback(false);
+  #elif defined(ESP8266)
+    if (Update.hasError()) {
+      if (serialDebug) {
+        Serial.println("Web Update failed!");
+        Update.printError(Serial);
+      }
+      server->send(500, "text/plain", "Update failed");
+      if (onWebUpdateEndCallback) {
+        onWebUpdateEndCallback(false);
+      }
+    } else {
+      if (serialDebug) {
+        Serial.println("Web Update successful!");
+      }
+      server->send(200, "text/plain", "Update successful! Device will restart...");
+      if (onWebUpdateEndCallback) {
+        onWebUpdateEndCallback(true);
+      }
+      delay(1000);
+      restart();
     }
-  } else {
-    if (serialDebug) {
-      Serial.println("Web Update successful!");
-    }
-    server->send(200, "text/plain", "Update successful! ESP32 will restart...");
-    if (onWebUpdateEndCallback) {
-      onWebUpdateEndCallback(true);
-    }
-    delay(1000);
-    ESP.restart();
-  }
+  #endif
 }
 
-// FIXED: Handle update request with proper password validation
+// Handle update request with proper password validation
 void AViShaOTA::handleUpdate() {
   HTTPUpload& upload = server->upload();
   static bool passwordChecked = false;
   static bool passwordValid = false;
 
   if (upload.status == UPLOAD_FILE_START) {
-    // Reset password validation flags
     passwordChecked = false;
     passwordValid = false;
     
-    // Check password if set - FIXED: Get password from multipart form
+    // Check password if set
     if (otaPassword.length() > 0) {
-      // Try different ways to get the password from multipart form
       String receivedPassword = "";
       
-      // Method 1: Try to get from server args (works for some cases)
       if (server->hasArg("password")) {
         receivedPassword = server->arg("password");
       }
       
-      // Method 2: Check in multipart form data
       if (receivedPassword.length() == 0) {
-        // The password might be in the multipart data before file upload starts
-        // We need to store it when it comes through
         for (int i = 0; i < server->args(); i++) {
           if (server->argName(i) == "password") {
             receivedPassword = server->arg(i);
@@ -354,8 +634,6 @@ void AViShaOTA::handleUpdate() {
       
       if (serialDebug) {
         Serial.println("Checking OTA password...");
-        Serial.print("Expected: '"); Serial.print(otaPassword); Serial.println("'");
-        Serial.print("Received: '"); Serial.print(receivedPassword); Serial.println("'");
       }
       
       if (receivedPassword != otaPassword) {
@@ -368,7 +646,7 @@ void AViShaOTA::handleUpdate() {
       
       passwordValid = true;
     } else {
-      passwordValid = true; // No password required
+      passwordValid = true;
     }
     
     passwordChecked = true;
@@ -382,17 +660,28 @@ void AViShaOTA::handleUpdate() {
       onWebUpdateStartCallback();
     }
 
-    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-      if (serialDebug) {
-        Serial.println("Update.begin() failed:");
-        Update.printError(Serial);
+    #if defined(ESP32)
+      if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+        if (serialDebug) {
+          Serial.println("Update.begin() failed:");
+          Update.printError(Serial);
+        }
+        webUpdateInProgress = false;
+        return;
       }
-      webUpdateInProgress = false;
-      return;
-    }
+    #elif defined(ESP8266)
+      uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+      if (!Update.begin(maxSketchSpace)) {
+        if (serialDebug) {
+          Serial.println("Update.begin() failed:");
+          Update.printError(Serial);
+        }
+        webUpdateInProgress = false;
+        return;
+      }
+    #endif
   }
   else if (upload.status == UPLOAD_FILE_WRITE) {
-    // Only proceed if password was validated
     if (!passwordChecked || !passwordValid) {
       return;
     }
@@ -436,14 +725,14 @@ void AViShaOTA::handleUpdate() {
   }
 }
 
-// Static WiFi event handler
+// Platform-specific WiFi event handlers
+#if defined(ESP32)
 void AViShaOTA::wifiEventHandler(WiFiEvent_t event) {
   if (instance) {
     instance->handleWiFiEvent(event);
   }
 }
 
-// WiFi event handler
 void AViShaOTA::handleWiFiEvent(WiFiEvent_t event) {
   switch (event) {
     case SYSTEM_EVENT_STA_DISCONNECTED:
@@ -474,22 +763,185 @@ void AViShaOTA::handleWiFiEvent(WiFiEvent_t event) {
       break;
   }
 }
+#endif
 
 // Utility methods
 String AViShaOTA::getLocalIP() {
-  return WiFi.localIP().toString();
+  #if defined(ESP32)
+    if (WiFi.getMode() == WIFI_AP) {
+      return WiFi.softAPIP().toString();
+    } else {
+      return WiFi.localIP().toString();
+    }
+  #elif defined(ESP8266)
+    if (WiFi.getMode() == WIFI_AP) {
+      return WiFi.softAPIP().toString();
+    } else {
+      return WiFi.localIP().toString();
+    }
+  #endif
 }
 
 String AViShaOTA::getUploadURL() {
   return "http://" + getLocalIP() + ":" + String(serverPort) + "/";
 }
 
+String AViShaOTA::getInfoURL() {
+  return "http://" + getLocalIP() + ":" + String(serverPort) + "/info";
+}
+
 bool AViShaOTA::isConnected() {
   return WiFi.status() == WL_CONNECTED;
 }
 
+#if defined(ESP32)
+WiFiMode_t AViShaOTA::getWiFiMode() {
+  return WiFi.getMode();
+}
+#elif defined(ESP8266)
+WiFiMode AViShaOTA::getWiFiMode() {
+  return WiFi.getMode();
+}
+#endif
+
+// System utility methods
 void AViShaOTA::restart() {
-  ESP.restart();
+  #if defined(ESP32)
+    ESP.restart();
+  #elif defined(ESP8266)
+    ESP.restart();
+  #endif
+}
+
+void AViShaOTA::factoryReset() {
+  #if defined(ESP32)
+    // Clear preferences and restart
+  #elif defined(ESP8266)
+    // Clear EEPROM and restart
+    EEPROM.begin(512);
+    for (int i = 0; i < 512; i++) {
+      EEPROM.write(i, 0);
+    }
+    EEPROM.commit();
+    EEPROM.end();
+  #endif
+  delay(1000);
+  restart();
+}
+
+String AViShaOTA::getChipID() {
+  #if defined(ESP32)
+    return String((uint32_t)ESP.getEfuseMac(), HEX);
+  #elif defined(ESP8266)
+    return String(ESP.getChipId(), HEX);
+  #endif
+}
+
+String AViShaOTA::getMACAddress() {
+  return WiFi.macAddress();
+}
+
+uint32_t AViShaOTA::getFreeHeap() {
+  return ESP.getFreeHeap();
+}
+
+uint32_t AViShaOTA::getFlashChipSize() {
+  #if defined(ESP32)
+    return ESP.getFlashChipSize();
+  #elif defined(ESP8266)
+    return ESP.getFlashChipRealSize();
+  #endif
+}
+
+String AViShaOTA::getSketchMD5() {
+  return ESP.getSketchMD5();
+}
+
+// Platform-specific system info methods
+#if defined(ESP32)
+String AViShaOTA::getCPUFreqMHz() {
+  return String(ESP.getCpuFreqMHz());
+}
+
+uint32_t AViShaOTA::getFlashChipSpeed() {
+  return ESP.getFlashChipSpeed();
+}
+
+String AViShaOTA::getSDKVersion() {
+  return ESP.getSdkVersion();
+}
+#elif defined(ESP8266)
+String AViShaOTA::getCPUFreqMHz() {
+  return String(ESP.getCpuFreqMHz());
+}
+
+uint32_t AViShaOTA::getFlashChipSpeed() {
+  return ESP.getFlashChipSpeed();
+}
+
+String AViShaOTA::getCoreVersion() {
+  return ESP.getCoreVersion();
+}
+
+String AViShaOTA::getBootVersion() {
+  return String(ESP.getBootVersion());
+}
+#endif
+
+// Configuration methods
+void AViShaOTA::setConfig(const Config& config) {
+  currentConfig = config;
+  hostname = config.hostname;
+  otaPassword = config.otaPassword;
+  serverPort = config.serverPort;
+  mdnsEnabled = config.mdnsEnabled;
+  serialDebug = config.serialDebug;
+  autoReconnect = config.autoReconnect;
+}
+
+AViShaOTA::Config AViShaOTA::getConfig() {
+  return currentConfig;
+}
+
+// Logging methods
+void AViShaOTA::logMessage(const String& message) {
+  if (serialDebug) {
+    Serial.println("[AViShaOTA] " + message);
+  }
+}
+
+void AViShaOTA::logError(const String& error) {
+  lastError = error;
+  if (serialDebug) {
+    Serial.println("[AViShaOTA ERROR] " + error);
+  }
+}
+
+// Get system info as JSON
+String AViShaOTA::getSystemInfo() {
+  String json = "{";
+  json += "\"platform\":\"" + getPlatform() + "\",";
+  json += "\"version\":\"" + String(getVersion()) + "\",";
+  json += "\"chipId\":\"" + getChipID() + "\",";
+  json += "\"macAddress\":\"" + getMACAddress() + "\",";
+  json += "\"freeHeap\":" + String(getFreeHeap()) + ",";
+  json += "\"flashSize\":" + String(getFlashChipSize()) + ",";
+  json += "\"cpuFreq\":\"" + getCPUFreqMHz() + "MHz\",";
+  json += "\"sketchMD5\":\"" + getSketchMD5() + "\",";
+  
+  #if defined(ESP32)
+    json += "\"sdkVersion\":\"" + getSDKVersion() + "\",";
+  #elif defined(ESP8266)
+    json += "\"coreVersion\":\"" + getCoreVersion() + "\",";
+    json += "\"bootVersion\":\"" + getBootVersion() + "\",";
+  #endif
+  
+  json += "\"wifiStatus\":\"" + String(WiFi.status()) + "\",";
+  json += "\"localIP\":\"" + getLocalIP() + "\",";
+  json += "\"hostname\":\"" + getHostname() + "\"";
+  json += "}";
+  
+  return json;
 }
 
 // FIXED: Updated HTML with better password handling
@@ -502,126 +954,127 @@ const char* AViShaOTA::getUploadHTML() {
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>AViSha OTA Update</title>
   <style>
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen,
-        Ubuntu, Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
-      margin: 0;
-      padding: 0;
-      background: #f2f2f7;
-    }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen,
+    Ubuntu, Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
+  margin: 0;
+  padding: 0;
+  background: #f2f2f7;
+}
 
-    .container {
-      max-width: 400px;
-      margin: 80px auto;
-      background: #fff;
-      border-radius: 20px;
-      box-shadow: 0 8px 20px rgba(0, 0, 0, 0.08);
-      padding: 30px;
-      text-align: center;
-    }
+.container {
+  max-width: 400px;
+  margin: 80px auto;
+  background: #fff;
+  border-radius: 20px;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.08);
+  padding: 30px;
+  text-align: center;
+}
 
-    h1 {
-      font-size: 24px;
-      margin-bottom: 10px;
-      color: #111;
-    }
+h1 {
+  font-size: 24px;
+  margin-bottom: 10px;
+  color: #111;
+}
 
-    p {
-      color: #555;
-      font-size: 14px;
-      margin-bottom: 20px;
-    }
+p {
+  color: #555;
+  font-size: 14px;
+  margin-bottom: 20px;
+}
 
-    .upload-area {
-      border: 2px dashed #d1d1d6;
-      border-radius: 12px;
-      padding: 30px 10px;
-      background-color: #fafafa;
-      transition: background 0.3s ease;
-    }
+.upload-area {
+  border: 2px dashed #1abc9c; /* tosca border */
+  border-radius: 12px;
+  padding: 30px 10px;
+  background-color: #fafafa;
+  transition: background 0.3s ease;
+}
 
-    .upload-area:hover {
-      background: #f0f0f5;
-    }
+.upload-area:hover {
+  background: #e0f7f4; /* lebih soft tosca */
+}
 
-    input[type="password"], input[type="file"] {
-      margin-top: 15px;
-      padding: 10px;
-      border: 1px solid #d1d1d6;
-      border-radius: 8px;
-      font-size: 14px;
-      width: 80%;
-      max-width: 250px;
-    }
+input[type="password"], input[type="file"] {
+  margin-top: 15px;
+  padding: 10px;
+  border: 1px solid #1abc9c;
+  border-radius: 8px;
+  font-size: 14px;
+  width: 80%;
+  max-width: 250px;
+}
 
-    input[type="file"] {
-      cursor: pointer;
-      padding: 8px;
-    }
+input[type="file"] {
+  cursor: pointer;
+  padding: 8px;
+}
 
-    button {
-      margin-top: 20px;
-      background-color: #007aff;
-      color: white;
-      border: none;
-      padding: 12px 24px;
-      font-size: 16px;
-      border-radius: 12px;
-      cursor: pointer;
-      transition: background 0.3s ease;
-      min-width: 150px;
-    }
+button {
+  margin-top: 20px;
+  background-color: #1abc9c; /* tosca utama */
+  color: white;
+  border: none;
+  padding: 12px 24px;
+  font-size: 16px;
+  border-radius: 12px;
+  cursor: pointer;
+  transition: background 0.3s ease;
+  min-width: 150px;
+}
 
-    button:hover:not(:disabled) {
-      background-color: #005ed9;
-    }
+button:hover:not(:disabled) {
+  background-color: #159c88; /* tosca lebih gelap */
+}
 
-    button:disabled {
-      background-color: #8e8e93;
-      cursor: not-allowed;
-    }
+button:disabled {
+  background-color: #8e8e93;
+  cursor: not-allowed;
+}
 
-    .progress {
-      width: 100%;
-      background-color: #e5e5ea;
-      border-radius: 12px;
-      margin-top: 25px;
-      height: 12px;
-      overflow: hidden;
-      display: none;
-    }
+.progress {
+  width: 100%;
+  background-color: #e5e5ea;
+  border-radius: 12px;
+  margin-top: 25px;
+  height: 12px;
+  overflow: hidden;
+  display: none;
+}
 
-    .progress-bar {
-      height: 100%;
-      width: 0%;
-      background-color: #34c759;
-      transition: width 0.3s ease;
-    }
+.progress-bar {
+  height: 100%;
+  width: 0%;
+  background-color: #1abc9c; /* progress bar tosca */
+  transition: width 0.3s ease;
+}
 
-    #status {
-      margin-top: 25px;
-      font-size: 14px;
-      color: #333;
-    }
+#status {
+  margin-top: 25px;
+  font-size: 14px;
+  color: #333;
+}
 
-    .status-success {
-      color: #28a745;
-    }
+.status-success {
+  color: #1abc9c; /* hijau diganti tosca */
+}
 
-    .status-error {
-      color: #ff3b30;
-    }
+.status-error {
+  color: #ff3b30;
+}
 
-    .file-info {
-      margin-top: 10px;
-      font-size: 12px;
-      color: #666;
-    }
+.file-info {
+  margin-top: 10px;
+  font-size: 12px;
+  color: #666;
+}
+
   </style>
 </head>
 <body>
   <div class="container">
-    <h1>ESP32 OTA Update</h1>
+    <h1>AViSha OTA Update</h1>
     <p>Select a .bin file to update your device's firmware.</p>
 
     <div class="upload-area">
