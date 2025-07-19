@@ -1,28 +1,47 @@
 #ifndef AVISHA_OTA_H
 #define AVISHA_OTA_H
 
-// ESP32 specific includes
-#include <Arduino.h>
-#include <WiFi.h>
-#include <ArduinoOTA.h>
-#include <WebServer.h>
-#include <ESPmDNS.h>
-#include <Update.h>
-#include <WiFiClient.h>
+// Platform detection and includes
+#if defined(ESP32)
+    #include <Arduino.h>
+    #include <WiFi.h>
+    #include <ArduinoOTA.h>
+    #include <WebServer.h>
+    #include <ESPmDNS.h>
+    #include <Update.h>
+    #include <WiFiClient.h>
+    #include <esp_wifi.h>
+    #define AVISHA_PLATFORM "ESP32"
+    #define AVISHA_WEBSERVER WebServer
+    #define AVISHA_WIFI_EVENT WiFiEvent_t
+#elif defined(ESP8266)
+    #include <Arduino.h>
+    #include <ESP8266WiFi.h>
+    #include <ArduinoOTA.h>
+    #include <ESP8266WebServer.h>
+    #include <ESP8266mDNS.h>
+    #include <Updater.h>
+    #include <WiFiClient.h>
+    #define AVISHA_PLATFORM "ESP8266"
+    #define AVISHA_WEBSERVER ESP8266WebServer
+    #define AVISHA_WIFI_EVENT WiFiEventStationModeGotIP
+#else
+    #error "Platform not supported. This library supports ESP32 and ESP8266 only."
+#endif
 
 // Version information
-#define AVISHA_OTA_VERSION "1.2.0"
+#define AVISHA_OTA_VERSION "1.2.1"
 
 // Default configuration
 #define AVISHA_OTA_DEFAULT_PORT 80
-#define AVISHA_OTA_DEFAULT_HOSTNAME "AViShaOTA_ESP32"
+#define AVISHA_OTA_DEFAULT_HOSTNAME "AViShaOTA_Device"
 #define AVISHA_OTA_WIFI_TIMEOUT 30000
 #define AVISHA_OTA_UPLOAD_TIMEOUT 300000
 
 class AViShaOTA {
 private:
     // Core components
-    WebServer* server;
+    AVISHA_WEBSERVER* server;
     String hostname;
     String otaPassword;
     int serverPort;
@@ -45,11 +64,23 @@ private:
     void (*onStartCallback)();
     void (*onEndCallback)();
     void (*onProgressCallback)(unsigned int progress, unsigned int total);
-    void (*onErrorCallback)(ota_error_t error);
+    #if defined(ESP32)
+        void (*onErrorCallback)(ota_error_t error);
+    #elif defined(ESP8266)
+        void (*onErrorCallback)(ota_error_t error);
+    #endif
     void (*onWiFiConnectedCallback)();
     void (*onWiFiDisconnectedCallback)();
     void (*onWebUpdateStartCallback)();
     void (*onWebUpdateEndCallback)(bool success);
+    
+    // Platform-specific event handlers
+    #if defined(ESP32)
+        WiFiEventId_t wifiEventId;
+    #elif defined(ESP8266)
+        WiFiEventHandler wifiConnectHandler;
+        WiFiEventHandler wifiDisconnectHandler;
+    #endif
     
     // Internal setup methods
     void setupWebServer();
@@ -65,9 +96,14 @@ private:
     void handleInfo();
     void handleRestart();
     
-    // WiFi event handling
-    static void wifiEventHandler(WiFiEvent_t event);
-    void handleWiFiEvent(WiFiEvent_t event);
+    // WiFi event handling (platform-specific implementations)
+    #if defined(ESP32)
+        static void wifiEventHandler(WiFiEvent_t event);
+        void handleWiFiEvent(WiFiEvent_t event);
+    #elif defined(ESP8266)
+        void onWiFiConnected(const WiFiEventStationModeGotIP& event);
+        void onWiFiDisconnected(const WiFiEventStationModeDisconnected& event);
+    #endif
     void checkWiFiConnection();
     
     // Utility methods
@@ -109,7 +145,11 @@ public:
     void onStart(void (*callback)());
     void onEnd(void (*callback)());
     void onProgress(void (*callback)(unsigned int progress, unsigned int total));
-    void onError(void (*callback)(ota_error_t error));
+    #if defined(ESP32)
+        void onError(void (*callback)(ota_error_t error));
+    #elif defined(ESP8266)
+        void onError(void (*callback)(ota_error_t error));
+    #endif
     void onWiFiConnected(void (*callback)());
     void onWiFiDisconnected(void (*callback)());
     void onWebUpdateStart(void (*callback)());
@@ -128,7 +168,11 @@ public:
     bool isConnected();
     bool isOTAInProgress();
     bool isWebUpdateInProgress();
-    WiFiMode_t getWiFiMode();
+    #if defined(ESP32)
+        WiFiMode_t getWiFiMode();
+    #elif defined(ESP8266)
+        WiFiMode getWiFiMode();
+    #endif
     
     // System utility methods
     void restart();
@@ -139,6 +183,18 @@ public:
     uint32_t getFlashChipSize();
     String getSketchMD5();
     
+    // Platform-specific system info
+    #if defined(ESP32)
+        String getCPUFreqMHz();
+        uint32_t getFlashChipSpeed();
+        String getSDKVersion();
+    #elif defined(ESP8266)
+        String getCPUFreqMHz();
+        uint32_t getFlashChipSpeed();
+        String getCoreVersion();
+        String getBootVersion();
+    #endif
+    
     // Status and information methods
     bool getInitializationStatus();
     String getHostname();
@@ -146,6 +202,7 @@ public:
     bool isMDNSEnabled();
     bool isSerialDebugEnabled();
     String getLastError();
+    String getPlatform();
     
     // Static utility methods
     static const char* getVersion();
@@ -178,8 +235,13 @@ public:
     // Advanced configuration methods
     void setConfig(const Config& config);
     Config getConfig();
-    bool loadConfig(); // Load from EEPROM/preferences
-    bool saveConfig(); // Save to EEPROM/preferences
+    #if defined(ESP32)
+        bool loadConfig(); // Load from Preferences
+        bool saveConfig(); // Save to Preferences
+    #elif defined(ESP8266)
+        bool loadConfig(); // Load from EEPROM
+        bool saveConfig(); // Save to EEPROM
+    #endif
     
 private:
     // Internal state
@@ -192,6 +254,15 @@ private:
     void cleanup();
     bool isValidConfiguration();
     void updateInternalState();
+    
+    // Platform-specific helper methods
+    #if defined(ESP32)
+        String getResetReason();
+        void initPreferences();
+    #elif defined(ESP8266)
+        String getResetReason();
+        void initEEPROM();
+    #endif
 };
 
 // Global helper functions
@@ -201,6 +272,27 @@ namespace AViShaOTAUtils {
     String getBootMode();
     bool isValidIPAddress(const String& ip);
     String generateRandomPassword(int length = 8);
+    
+    // Platform detection utilities
+    bool isESP32();
+    bool isESP8266();
+    String getPlatformName();
+    
+    // Platform-specific utilities
+    #if defined(ESP32)
+        String getChipModel();
+        uint8_t getChipRevision();
+        uint32_t getApbFrequency();
+    #elif defined(ESP8266)
+        uint32_t getChipId();
+        uint32_t getCycleCount();
+        String getFlashChipMode();
+    #endif
 }
+
+// Platform compatibility macros
+#if defined(ESP8266)
+    #define WiFiMode_t WiFiMode
+#endif
 
 #endif // AVISHA_OTA_H
